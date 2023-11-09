@@ -58,7 +58,7 @@ with open(train_csv,"r") as f:
 
 
 
-#%% Load torch dataset
+#%% Load dict into torch dataset
 
 class trainDataset(torch.utils.data.Dataset):
     """Some Information about MyDataset"""
@@ -110,7 +110,7 @@ model = torchvision.models.resnet50(pretrained=True)
 
 # %% build neural net
 
-model.cuda()
+model.to(device)
 
 # Define the loss function and optimizer
 criterion = nn.CrossEntropyLoss()
@@ -153,8 +153,8 @@ for batch, (images, labels) in enumerate(train_dataloader,1):
 
         _, preds = torch.max(outputs, 1)
         running_corrects += torch.sum(preds == labels.data)
-    epoch_acc = running_corrects.double() / len(val_dataset)
+    epoch_acc = running_corrects.double() / len(val_data)
 
     # Print the loss and accuracy for this epoch
-    print('Epoch [{}/{}], Loss: {:.4f}, Val Acc: {:.4f}'.format(epoch+1, num_epochs, epoch_loss, epoch_acc))
+    print('Epoch [{}/{}], Loss: {:.4f}, Val Acc: {:.4f}'.format(num_epochs+1, num_epochs, epoch_loss, epoch_acc))
 # %%
