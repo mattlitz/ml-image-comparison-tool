@@ -17,8 +17,8 @@ import seaborn as sns
 from tqdm.notebook import tqdm
 from sklearn.model_selection import train_test_split
 
-import mlflow
-mlflow.autolog()
+#import mlflow
+#mlflow.autolog()
 
 
 #%% 
@@ -35,6 +35,10 @@ from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms
 
 
+writer = SummaryWriter()
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+print(device)
 
 
 #%% #load images to dict for training
