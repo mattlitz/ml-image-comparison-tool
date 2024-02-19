@@ -9,6 +9,7 @@ import os
 import numpy as np
 import pandas as pd
 import csv
+import h5py
 
 #read images
 from skimage.io import imread, imshow
@@ -26,18 +27,17 @@ from sklearn.metrics import precision_recall_curve
 #%% 
 #pytorch neural nets
 import torch
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import torch.utils.data as data
 import torchvision
-
+import timm
 from torch.utils.tensorboard import SummaryWriter
 from torchvision.transforms import v2
 
 from transformers import AutoImageProcessor, ViTForImageClassification
-from transformers import ViTFeatureExtractor, ViTModel
+from transformers import ViTModel, ViTConfig
 
 writer = SummaryWriter()
 
@@ -47,38 +47,52 @@ print(device)
 #%% #load images to dict for training
 
 # Define the path to the directory containing the images
-train_csv = r'image_path.csv'
 
-def load_images(path):
-    img = imread(path)
-    img = gray2rgb(img) #convert to rgb for transfer learning
-    return np.array(np.uint8(img))
- 
+class buildData:
+    def __init__(self, data_csv):
 
-with open(train_csv,"r") as f:
-    data_dict = {'image': [], 'label': []}
-    reader = csv.DictReader(f)
-    for row in reader:
-        image_path = row['path']
-        data_dict['image'].append(load_images(image_path))     
-        data_dict['label'].append(np.uint8(row['label']))
+        self.data_csv = data_csv
+        self.labels, self.images = self.load_to_array()
 
+    def load_images(self, path):
+        img = imread(path, as_gray=True)
+        img = gray2rgb(img) #convert to rgb for transfer learning
 
+        return np.array(np.float32(img)).transpose(2,0,1)
+
+    
+    def load_to_array(self):
+        img_list =[]
+        lbl_list = []
+
+        with open(self.data_csv,"r") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                img_list.append(self.load_images(row['path']))     
+                lbl_list.append(np.uint8(row['label']))
+
+            #convert list to numpy array
+            labels = np.array(lbl_list).reshape(-1,1)
+            images = np.array(img_list)
+            
+            return labels, images
 
 
 #%% Load torch dataset
 
-class trainDataset(torch.utils.data.Dataset):
-    def __init__(self, data_dict, transform=None):
-        super(trainDataset, self).__init__()
-        self.data_dict = data_dict
+class buildDataset(torch.utils.data.Dataset):
+    def __init__(self, images, labels, transform=None):
+        super(buildDataset, self).__init__()
+
+        self.images = torch.from_numpy(images).float()
+        self.labels = torch.from_numpy(labels).float()
 
         self.transform = transform
 
-    def __getitem__(self, index):
+    def __getitem__(self, idx):
 
-        image = self.data_dict['image'][index]
-        label = torch.tensor(self.data_dict['label'][index])
+        image = self.images[idx]
+        label = self.labels[idx]
 
         if self.transform:
             image = self.transform(image)
@@ -86,122 +100,151 @@ class trainDataset(torch.utils.data.Dataset):
         return image, label 
 
     def __len__(self):
-        return len(self.data_dict['image'])
+        return len(self.labels)
+
+#%% Create model class
+"""
+class ViTBinaryClassifier(nn.Module):
+    def __init__(self, vit_model):
+        super().__init__()
+        self.vit = vit_model
+        self.classifier = nn.Linear(self.vit.config.hidden_size, 1)
+
+    def forward(self, pixel_values, pixel_mask):
+        outputs = self.vit(pixel_values=pixel_values, pixel_mask=pixel_mask)
+        logits = self.classifier(outputs.pooler_output)
+        return logits
+"""
+class ViTBinaryClassifier(nn.Module):
+    def __init__(self):
+        super(ViTBinaryClassifier, self).__init__()
+        # Load the pre-trained ViT model
+        self.vit = timm.create_model('vit_base_patch16_224', pretrained=True)
+        # Replace the last layer for binary classification
+        self.vit.head = nn.Linear(self.vit.head.in_features, 1)
+
+    def forward(self, x):
+        x = self.vit(x)
+        return torch.sigmoid(x)
 
 
 
 #%% Split training data into 80/20 train/val
 
+def train(dataloader, model, loss_fn, optimizer):
+    train_loss = 0
+    train_acc = 0
+    size = len(dataloader.dataset)
+    model.train()
+    for batch, (X, y) in enumerate(dataloader):
+        X, y = X.to(device), y.to(device)
+
+        # Compute prediction error
+        pred = model(X)
+        train_loss = loss_fn(pred, y)
+
+        # Backpropagation
+        train_loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+
+        if batch % 100 == 0:
+            train_loss, current = train_loss.item(), (batch + 1) * len(X)
+            print(f"loss: {train_loss:>7f}  [{current:>5d}/{size:>5d}]")
+
+    return train_acc, train_loss
 
 
+def test(dataloader, model, loss_fn, optimizer):
 
-
-def train():
-
-    # Train the model
-    
-    #for epoch in range(num_epochs):
-    for batch, (images, labels) in enumerate(train_dataloader):
-        # Train the model for one epoch
-        print('Epoch {}/{}'.format(epoch+1, num_epochs))
-        model.train()
-        running_loss = 0.0
-        for inputs, labels in train_dataloader:
-            inputs = inputs.to(device)
-            labels = labels.to(device)
-
-            optimizer.zero_grad()
-
-            predictions = model(inputs)
-            labels = labels.int64()
-            loss = criterion(predictions, labels)
-            
-            loss.backward()
-            optimizer.step()
-            running_loss += loss.item() * inputs.size(0)
-
-        epoch_loss = running_loss / len(train_dataset)
-
-
-
-def test():
-
-    # Evaluate the model on the validation set
+    size = len(dataloader.dataset)
+    num_batches = len(dataloader)
     model.eval()
+    test_loss, correct = 0, 0
 
-    for inputs, labels in test_dataloader:
-        inputs = inputs.to(device)
-        labels = labels.to(device)
+    with torch.no_grad():
+        for X, y in dataloader:
+            X, y = X.to(device), y.to(device)
+            outputs = model(X)
+            predictions = (outputs > 0.5).float()
+            test_loss += loss_fn(outputs, y).item()
+            correct += (predictions == y).sum().item()
+    test_loss /= num_batches
+    correct /= size
+    test_acc = 100*correct
+    print(f"Test Error: \n Accuracy: {(test_acc):>0.1f}%, Avg loss: {test_loss:>8f} \n")
 
-        outputs = model(inputs)
-        labels = labels.int64()
-
-        _, preds = torch.max(outputs, 1)
-        running_corrects += torch.sum(preds == labels.data)
-    epoch_acc = running_corrects.double() / len(val_dataset)
-
-    # Print the loss and accuracy for this epoch
-    print('Epoch [{}/{}], Loss: {:.4f}, Val Acc: {:.4f}'.format(epoch+1, num_epochs, epoch_loss, epoch_acc))
-
-
-
-
+    return test_acc, test_loss
 
 
 
 # %% Run training
 
-
 if __name__ == "__main__":
-    
-    model.cuda()
 
+    
+
+    # Load the pre-trained model
+    #config = ViTConfig.from_pretrained('google/vit-base-patch16-224')
+    #model = ViTModel(config)
+    model = ViTBinaryClassifier().to(device)
+
+    # Initialize the binary classifier
+    #binary_classifier = ViTBinaryClassifier(model).to(device)
+    
+  
     # Define the loss function and optimizer
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    criterion = nn.BCELoss()
+    optimizer = optim.Adam(model.parameters(), lr=5e-5)
+
 
     # Define the transforms to apply to the images
     transform = {
         "train": v2.Compose([
-            v2.RandomHorizontalCrop(224),
-            v2.ToDtype(),
-            v2.ToTensor()
+            #v2.RandomResizedCrop(224),
+            v2.Grayscale(num_output_channels=3),
+            v2.Resize((224,224)),
+            v2.ToDtype(torch.float32)
         ]),
         "test": v2.Compose([
-            v2.RandomHorizontalCrop(224),
-            v2.ToDtype(),
-            v2.ToTensor()
+            #v2.RandomResizedCrop(224),
+            v2.Grayscale(num_output_channels=3),
+            v2.Resize((224,224)),
+            v2.ToDtype(torch.float32)
         ])
     }
 
+    #load data into numpy arrays
+    train_csv = r'image_path.csv'
+    bd = buildData(train_csv)
+      
+    X_train, X_test, y_train, y_test = train_test_split(bd.images, bd.labels, test_size=0.2, random_state=42)
 
-    train_dataset = trainDataset(data_dict, transform=transform)
-    train_data, val_data = train_test_split(train_dataset, test_size=0.2, random_state=42)
-
-
-
+    train_dataset = buildDataset(X_train, y_train, transform=transform["train"])
+    test_dataset = buildDataset(X_test, y_test, transform=transform["test"])
 
     # Create the dataloaders
-    train_dataloader = data.DataLoader(train_data, batch_size=4, shuffle=True, num_workers=4)
-    test_dataloader = data.DataLoader(val_data, batch_size=4, shuffle=False, num_workers=4)
+    train_dataloader = data.DataLoader(train_dataset, batch_size=4, shuffle=True, num_workers=0)
+    test_dataloader = data.DataLoader(test_dataset, batch_size=4, shuffle=False, num_workers=0)
+ 
 
-    image_processor = AutoImageProcessor.from_pretrained("google/vit-base-patch16-224")
-    model = ViTForImageClassification.from_pretrained("google/vit-base-patch16-224")
+    #write image to Tensorboard
+    images, labels = next(iter(train_dataloader))
+    grid = torchvision.utils.make_grid(images)
+    writer.add_image('images', grid, 0)
+    #writer.add_graph(binary_classifier, images)
 
-    inputs = image_processor(image, return_tensors="pt")
 
-    with torch.no_grad():
-        logits = model(**inputs).logits
-
-    # model predicts one of the 1000 ImageNet classes
-    predicted_label = logits.argmax(-1).item()
-    print(model.config.id2label[predicted_label])
-
-    num_epochs = 10
+    #Begin train/test loop
+    num_epochs = 50
     for epoch in range(num_epochs):
-        train_acc, train_loss = train()
-        test_acc, test_loss = test()
+        print(f"Epoch {epoch+1}\n-------------------------------")
+        train_acc, train_loss = train(train_dataloader, model, criterion, optimizer)
+        test_acc, test_loss = test(test_dataloader, model, criterion, optimizer)
         writer.add_scalar('Loss/train', train_loss, epoch)
         writer.add_scalar('Loss/test', test_loss, epoch)
         writer.add_scalar('Accuracy/train', train_acc, epoch)
         writer.add_scalar('Accuracy/test', test_acc, epoch)
+    print("Done!")
+
+    writer.close()
