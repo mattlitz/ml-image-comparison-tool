@@ -16,7 +16,7 @@ patch_sklearn()
 
 #read images
 from skimage.io import imread, imshow
-from skimage.texture import greycomatrix, greycoprops
+from skimage.texture import graycomatrix, graycoprops
 import matplotlib.pyplot as plt
 
 #scikit-learn methods
@@ -25,12 +25,16 @@ from sklearn.gaussian_process import GaussianProcessClassifier
 from sklearn.linear_model import LogisticRegression
 
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.metrics import RocCurveDisplay, auc
+from sklearn.inspection import PartialDependenceDisplay
 
 
-#basyesian optimization
+#bayesian optimization
 from skopt import BayesGridSearchCV
+
+import shap
+shap.initjs()
 
 
 import mlflow
@@ -83,14 +87,6 @@ with open(train_csv,"r") as f:
         data_dict['otsu_segment'].append(gt.otsu_segment(load_images(image_path)))
         data_dict['kmeans_segment'].append(gt.kmeans_segment(load_images(image_path),5)) 
 
-    #calculate GLCM textures
-    glcm = greycomatrix(load_images(image_path), distances=[1], angles=[0], levels=256, symmetric=True, normed=True)
-    data_dict['Contrast'].append(greycoprops(glcm, 'contrast')[0, 0]),
-    data_dict['Dissimilarity'].append(greycoprops(glcm, 'dissimilarity')[0, 0]),
-    data_dict['Homogeneity'].append(greycoprops(glcm, 'homogeneity')[0, 0]),
-    data_dict['Energy'].append(greycoprops(glcm, 'energy')[0, 0]),
-    data_dict['Correlation'].append(greycoprops(glcm, 'correlation')[0, 0]),
-    data_dict['ASM'].append(greycoprops(glcm, 'ASM')[0, 0])
 
 #prepare feature data for training
 feature_df = pd.DataFrame(columns=['Image', 'Mean', 'Skew', 'Kurtosis', 'Variance', 'contrast', 'dissimilarity', 'homogeneity', 'energy', 'correlation', 'ASM', 'Target'])
@@ -98,22 +94,22 @@ feature_df = pd.DataFrame(columns=['Image', 'Mean', 'Skew', 'Kurtosis', 'Varianc
 # Loop over the images in the dictionary
 for image_name, image in data_dict.items():
     #calculate GLCM textures
-    glcm = greycomatrix(image, distances=[1], angles=[0], levels=256, symmetric=True, normed=True)
+    glcm = greycomatrix(load_images(image_path), distances=[1], angles=[0], levels=256, symmetric=True, normed=True)
 
     # Calculate the statistical features and store them in the DataFrame
     feature_df = feature_df.append({
-        'Image': image_name,
-        'Mean': np.mean(image),
-        'Skew': skew(image.flatten()),
-        'Kurtosis': kurtosis(image.flatten()),
-        'Variance': np.var(image),
+        'image': image_name,
+        'mean': np.mean(load_images(image_path)),
+        'skew': skew(load_images(image_path).flatten()),
+        'kurtosis': kurtosis(load_images(image_path).flatten()),
+        'variance': np.var(load_images(image_path)),
         'contrast': greycoprops(glcm, 'contrast')[0, 0], 
         'dissimilarity': greycoprops(glcm, 'dissimilarity')[0, 0], 
         'homogeneity': greycoprops(glcm, 'homogeneity')[0, 0], 
         'energy':greycoprops(glcm, 'energy')[0, 0], 
         'correlation': greycoprops(glcm, 'correlation')[0, 0], 
         'asm': greycoprops(glcm, 'ASM')[0, 0],
-        'Target': 'Target'
+        'target': 'Target'
     }, ignore_index=True)
 
 
@@ -133,6 +129,8 @@ params['min_samples_split'] = (2, 4, 6, 8)
 images = data_dict['image']
 labels = data_dict['label']
 
+X_train, X_test, y_train, y_test = train_test_split(images, labels, test_size=0.2, random_state=42)
+
 images = [img.flatten() for img in images]
 scaler = StandardScaler()
 images = scaler.fit_transform(images)
@@ -149,12 +147,14 @@ cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
 
 opt = BayesGridSearchCV(gbc, params, cv=cv)
 
+shap_values = None
+
 for fold, (train, test) in enumerate(cv.split(images, labels)):
     opt.fit(X[train], y[train])
     viz = RocCurveDisplay.from_estimator(
         opt,
-        X[test],
-        y[test],
+        X_test,
+        y_test,
         name=f"ROC fold {fold}",
         alpha=0.3,
         lw=1,
@@ -165,6 +165,17 @@ for fold, (train, test) in enumerate(cv.split(images, labels)):
     interp_tpr[0] = 0.0
     tprs.append(interp_tpr)
     aucs.append(viz.roc_auc)
+
+    #SHAPley values
+    if shap_values is None:
+        explainer = shap.Explainer(opt.best_estimator_)
+        shap_values = explainer(X_test)
+
+    else:
+        shap_values = np.vstack(
+            [shap_values, explainer(X_test)]
+        )
+
 
 mean_tpr = np.mean(tprs, axis=0)
 mean_tpr[-1] = 1.0
@@ -185,3 +196,8 @@ labels_pred = gpc.predict(images_test)
 
 
 # %% Calculate metrics
+
+shap.summary_plot(shap_values, X_test, plot_type='bar')
+
+
+PartialDependenceDisplay.from_estimator(gbc, X_test, features, kind='individual')
